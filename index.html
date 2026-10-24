@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sensor Logger</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#14161a; --card:#fff; --muted:#667; --accent:#2563eb; --ok:#16a34a; --warn:#d97706; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --fg:#e8eaee; --card:#1a1d23; --muted:#9aa; --accent:#3b82f6; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--fg); padding:16px; }
+  h1 { font-size:1.3rem; margin:0 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  button { width:100%; font-size:1.1rem; padding:16px; border:0; border-radius:10px; margin-bottom:10px; color:#fff; background:var(--accent); font-weight:600; touch-action:manipulation; }
+  button:disabled { opacity:.4; }
+  #stop { background:var(--bad); } #download, #share { background:var(--ok); } #mark { background:var(--warn); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; font-variant-numeric: tabular-nums; }
+  .label { color:var(--muted); font-size:.8rem; }
+  .val { font-size:1.15rem; font-weight:600; }
+  progress { width:100%; height:14px; }
+  #log { font-size:.8rem; color:var(--muted); white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Phone Sensor Logger</h1>
+
+<div class="card">
+  <button id="start">Start recording</button>
+  <button id="mark" disabled>Mark event (pothole / floor change)</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="download" disabled>Download CSV</button>
+  <button id="share" disabled hidden>Share CSV</button>
+</div>
+
+<div class="card">
+  <div class="label">Samples (target 1,000)</div>
+  <progress id="prog" max="1000" value="0"></progress>
+  <div class="grid" style="margin-top:10px">
+    <div><div class="label">Samples</div><div class="val" id="count">0</div></div>
+    <div><div class="label">Rate (last 1 s)</div><div class="val" id="rate">– Hz</div></div>
+    <div><div class="label">Accel x / y / z (m/s²)</div><div class="val" id="acc">–</div></div>
+    <div><div class="label">Gyro α / β / γ (°/s)</div><div class="val" id="gyro">–</div></div>
+    <div><div class="label">GPS</div><div class="val" id="gps">waiting</div></div>
+    <div><div class="label">Wake lock</div><div class="val" id="wake">off</div></div>
+    <div><div class="label">Marks</div><div class="val" id="marks">0</div></div>
+    <div><div class="label">Gaps &gt; 0.5 s</div><div class="val" id="gaps">0</div></div>
+  </div>
+</div>
+
+<div class="card"><div id="log">Tap Start. On iPhone you'll be asked to allow motion access, then location.</div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent = m; };
+const HEADER = ['timestamp_iso','t_ms','acc_g_x','acc_g_y','acc_g_z','acc_lin_x','acc_lin_y','acc_lin_z',
+  'rot_alpha','rot_beta','rot_gamma','interval_ms','lat','lon','gps_alt_m','gps_speed_mps','gps_acc_m','gps_age_ms','mark'];
+const GAP_MS = 500;
+
+let rows = [], t0 = 0, epoch0 = 0, recording = false, saved = true;
+let gps = null, gpsTime = 0, gpsWatch = null, wakeLock = null;
+let markPending = false, marks = 0, gaps = 0, lastT = null, gotData = false;
+let rateT = 0, rateN = 0;
+
+const f = (v, d = 4) => (v === null || v === undefined || Number.isNaN(v)) ? '' : Number(v).toFixed(d);
+
+// Prefer the event's own timestamp (when the sensor reading was created) over handler arrival time,
+// but only if it is on the performance.now() timeline (some old engines used epoch ms).
+const eventTime = e => {
+  const now = performance.now();
+  return (typeof e.timeStamp === 'number' && Math.abs(e.timeStamp - now) < 1000) ? e.timeStamp : now;
+};
+
+// Spec says milliseconds; older iOS Safari reported seconds (e.g. 0.0167).
+const intervalMs = v => (v === null || v === undefined) ? null : (v > 0 && v < 1 ? v * 1000 : v);
+
+function onMotion(e) {
+  if (!recording) return;
+  const g = e.accelerationIncludingGravity || {}, a = e.acceleration || {}, r = e.rotationRate || {};
+  // Desktop browsers may fire devicemotion with all-null values; don't record those.
+  if (g.x == null && a.x == null && r.alpha == null) return;
+  gotData = true;
+
+  const now = eventTime(e), t = now - t0;
+  if (lastT !== null && t - lastT > GAP_MS) { gaps++; $('gaps').textContent = gaps; }
+  lastT = t;
+
+  rows.push([
+    new Date(epoch0 + now).toISOString(), f(t, 1),
+    f(g.x), f(g.y), f(g.z), f(a.x), f(a.y), f(a.z),
+    f(r.alpha), f(r.beta), f(r.gamma), f(intervalMs(e.interval), 2),
+    gps ? f(gps.latitude, 7) : '', gps ? f(gps.longitude, 7) : '',
+    gps ? f(gps.altitude, 1) : '', gps ? f(gps.speed, 2) : '', gps ? f(gps.accuracy, 1) : '',
+    gps ? f(epoch0 + now - gpsTime, 0) : '',
+    markPending ? 1 : 0
+  ]);
+  markPending = false;
+  saved = false;
+
+  const n = rows.length;
+  if (t - rateT >= 1000) {
+    $('rate').textContent = ((n - rateN) * 1000 / (t - rateT)).toFixed(0) + ' Hz';
+    rateT = t; rateN = n;
+  }
+  if (n % 5 === 0) {
+    $('count').textContent = n;
+    $('prog').value = Math.min(n, 1000);
+    $('acc').textContent = `${f(g.x,1)} / ${f(g.y,1)} / ${f(g.z,1)}`;
+    $('gyro').textContent = `${f(r.alpha,0)} / ${f(r.beta,0)} / ${f(r.gamma,0)}`;
+    if (n >= 1000 && n < 1005) log('Reached 1,000 samples. Keep going or tap Stop.');
+  }
+}
+
+async function getWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      $('wake').textContent = 'on';
+      wakeLock.addEventListener('release', () => { $('wake').textContent = 'off'; });
+    } else { $('wake').textContent = 'unsupported'; }
+  } catch (err) { $('wake').textContent = 'failed'; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && recording) getWakeLock();
+  if (document.visibilityState === 'hidden' && recording) log('Page hidden: sensors pause while the screen is off or the tab is in the background.');
+});
+
+window.addEventListener('beforeunload', e => {
+  if (!saved && rows.length) { e.preventDefault(); e.returnValue = ''; }
+});
+
+function gpsError(err) {
+  const msg = { 1: 'denied', 2: 'unavailable', 3: 'timeout (retrying)' }[err.code] || 'error';
+  $('gps').textContent = msg;
+}
+
+$('start').onclick = async () => {
+  if (!window.isSecureContext) { log('This page must be served over HTTPS for sensors to work.'); return; }
+  // iOS: requestPermission must be the first await so it still counts as part of the tap.
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res !== 'granted') { log('Motion permission denied. On iPhone: Settings > Apps > Safari > Advanced > Website Data, delete this site, then reload and try again.'); return; }
+    }
+  } catch (err) { log('Motion permission error: ' + err.message); return; }
+
+  if (!saved && rows.length && !confirm(`Discard the ${rows.length} unsaved samples and start a new recording?`)) return;
+
+  rows = []; marks = 0; gaps = 0; lastT = null; gotData = false; saved = true; markPending = false;
+  gps = null; gpsTime = 0;
+  $('marks').textContent = 0; $('gaps').textContent = 0; $('count').textContent = 0; $('prog').value = 0;
+  $('rate').textContent = '– Hz'; $('gps').textContent = 'waiting';
+
+  if ('geolocation' in navigator) {
+    gpsWatch = navigator.geolocation.watchPosition(
+      p => { gps = p.coords; gpsTime = p.timestamp; $('gps').textContent = `±${p.coords.accuracy.toFixed(0)} m`; },
+      gpsError,
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 }
+    );
+  } else { $('gps').textContent = 'unsupported'; }
+
+  t0 = performance.now();
+  // performance.timeOrigin is missing on older iOS; derive the epoch offset ourselves.
+  epoch0 = Date.now() - performance.now();
+  rateT = 0; rateN = 0;
+  recording = true;
+  window.addEventListener('devicemotion', onMotion);
+  await getWakeLock();
+  $('start').disabled = true; $('stop').disabled = false; $('mark').disabled = false;
+  $('download').disabled = true; $('share').disabled = true;
+  log('Recording… keep this page open and the screen on.');
+  setTimeout(() => { if (recording && !gotData) log('No motion data received. This browser or device may not provide motion sensors.'); }, 3000);
+};
+
+$('mark').onclick = () => {
+  markPending = true; marks++;
+  $('marks').textContent = marks;
+  if (navigator.vibrate) navigator.vibrate(40);
+};
+
+$('stop').onclick = () => {
+  recording = false;
+  window.removeEventListener('devicemotion', onMotion);
+  if (gpsWatch !== null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  $('count').textContent = rows.length; $('prog').value = Math.min(rows.length, 1000);
+  $('start').disabled = false; $('stop').disabled = true; $('mark').disabled = true;
+  $('download').disabled = $('share').disabled = rows.length === 0;
+  log(`Stopped with ${rows.length} samples${gaps ? `, ${gaps} gap(s)` : ''}. Tap Download CSV.`);
+};
+
+function buildFile() {
+  const csv = [HEADER.join(','), ...rows.map(r => r.join(','))].join('\n') + '\n';
+  const name = `sensors_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+  return { csv, name };
+}
+
+$('download').onclick = () => {
+  const { csv, name } = buildFile();
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  saved = true;
+};
+
+// Web Share with files: handy on iPhone (save to Files, AirDrop) and Android (Drive, email).
+try {
+  if (navigator.canShare && navigator.canShare({ files: [new File([''], 'x.csv', { type: 'text/csv' })] })) {
+    $('share').hidden = false;
+    $('share').onclick = async () => {
+      const { csv, name } = buildFile();
+      try {
+        await navigator.share({ files: [new File([csv], name, { type: 'text/csv' })], title: name });
+        saved = true;
+      } catch (err) { if (err.name !== 'AbortError') log('Share failed: ' + err.message + '. Use Download instead.'); }
+    };
+  }
+} catch (err) { /* sharing unsupported */ }
+</script>
+</body>
+</html>
