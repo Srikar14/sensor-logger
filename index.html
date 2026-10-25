@@ -14,7 +14,7 @@
   .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
   button { width:100%; font-size:1.1rem; padding:16px; border:0; border-radius:10px; margin-bottom:10px; color:#fff; background:var(--accent); font-weight:600; touch-action:manipulation; }
   button:disabled { opacity:.4; }
-  #stop { background:var(--bad); } #download, #share { background:var(--ok); } #mark { background:var(--warn); }
+  #gpscheck { background:#475569; } #stop { background:var(--bad); } #download, #share { background:var(--ok); } #mark { background:var(--warn); }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; font-variant-numeric: tabular-nums; }
   .label { color:var(--muted); font-size:.8rem; }
   .val { font-size:1.15rem; font-weight:600; }
@@ -26,6 +26,7 @@
 <h1>Phone Sensor Logger</h1>
 
 <div class="card">
+  <button id="gpscheck">Check GPS</button>
   <button id="start">Start recording</button>
   <button id="mark" disabled>Mark event (pothole / floor change)</button>
   <button id="stop" disabled>Stop</button>
@@ -45,6 +46,18 @@
     <div><div class="label">Wake lock</div><div class="val" id="wake">off</div></div>
     <div><div class="label">Marks</div><div class="val" id="marks">0</div></div>
     <div><div class="label">Gaps &gt; 0.5 s</div><div class="val" id="gaps">0</div></div>
+  </div>
+</div>
+
+<div class="card" id="gpsinfo" hidden>
+  <div class="label">GPS check (browsers can't see satellites; accuracy is the best proxy for signal)</div>
+  <div class="grid" style="margin-top:10px">
+    <div><div class="label">Fix quality</div><div class="val" id="gq">–</div></div>
+    <div><div class="label">Accuracy</div><div class="val" id="gacc">–</div></div>
+    <div><div class="label">Fixes received</div><div class="val" id="gfix">0</div></div>
+    <div><div class="label">Last fix</div><div class="val" id="gage">–</div></div>
+    <div><div class="label">Altitude</div><div class="val" id="galt">–</div></div>
+    <div><div class="label">Speed</div><div class="val" id="gspd">–</div></div>
   </div>
 </div>
 
@@ -135,6 +148,43 @@ function gpsError(err) {
   $('gps').textContent = msg;
 }
 
+// GPS check: watch position without recording, to see whether a fix exists and how good it is.
+let checkWatch = null, checkFixes = 0, checkLast = 0, checkTimer = null;
+const QUALITY = [[10, 'good', 'var(--ok)'], [30, 'fair', 'var(--warn)'], [Infinity, 'poor', 'var(--bad)']];
+
+function stopGpsCheck() {
+  if (checkWatch !== null) { navigator.geolocation.clearWatch(checkWatch); checkWatch = null; }
+  clearInterval(checkTimer);
+  $('gpscheck').textContent = 'Check GPS';
+}
+
+$('gpscheck').onclick = () => {
+  if (checkWatch !== null) { stopGpsCheck(); return; }
+  if (!window.isSecureContext) { log('This page must be served over HTTPS for GPS to work.'); return; }
+  if (!('geolocation' in navigator)) { log('This browser has no geolocation support.'); return; }
+  checkFixes = 0; checkLast = 0;
+  $('gpsinfo').hidden = false;
+  $('gq').textContent = 'searching…'; $('gq').style.color = '';
+  $('gfix').textContent = 0; $('gacc').textContent = $('gage').textContent = $('galt').textContent = $('gspd').textContent = '–';
+  checkWatch = navigator.geolocation.watchPosition(p => {
+    const c = p.coords, [, label, color] = QUALITY.find(([max]) => c.accuracy <= max);
+    checkFixes++; checkLast = Date.now();
+    $('gq').textContent = label; $('gq').style.color = color;
+    $('gacc').textContent = `±${c.accuracy.toFixed(0)} m`;
+    $('gfix').textContent = checkFixes;
+    $('galt').textContent = c.altitude == null ? 'n/a' : `${c.altitude.toFixed(0)} m` + (c.altitudeAccuracy == null ? '' : ` ±${c.altitudeAccuracy.toFixed(0)}`);
+    $('gspd').textContent = c.speed == null ? 'n/a' : `${(c.speed * 3.6).toFixed(1)} km/h`;
+  }, err => {
+    $('gq').textContent = { 1: 'denied', 2: 'unavailable', 3: 'no fix yet' }[err.code] || 'error';
+    $('gq').style.color = 'var(--bad)';
+  }, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+  checkTimer = setInterval(() => {
+    $('gage').textContent = checkLast ? `${((Date.now() - checkLast) / 1000).toFixed(0)} s ago` : '–';
+  }, 1000);
+  $('gpscheck').textContent = 'Stop GPS check';
+  log('Checking GPS. Go outdoors with a clear view of the sky; the first fix can take 10–60 s. "good" = within 10 m.');
+};
+
 $('start').onclick = async () => {
   if (!window.isSecureContext) { log('This page must be served over HTTPS for sensors to work.'); return; }
   // iOS: requestPermission must be the first await so it still counts as part of the tap.
@@ -147,6 +197,7 @@ $('start').onclick = async () => {
 
   if (!saved && rows.length && !confirm(`Discard the ${rows.length} unsaved samples and start a new recording?`)) return;
 
+  stopGpsCheck(); $('gpscheck').disabled = true;
   rows = []; marks = 0; gaps = 0; lastT = null; gotData = false; saved = true; markPending = false;
   gps = null; gpsTime = 0;
   $('marks').textContent = 0; $('gaps').textContent = 0; $('count').textContent = 0; $('prog').value = 0;
@@ -185,7 +236,7 @@ $('stop').onclick = () => {
   if (gpsWatch !== null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
   if (wakeLock) { wakeLock.release(); wakeLock = null; }
   $('count').textContent = rows.length; $('prog').value = Math.min(rows.length, 1000);
-  $('start').disabled = false; $('stop').disabled = true; $('mark').disabled = true;
+  $('start').disabled = false; $('stop').disabled = true; $('mark').disabled = true; $('gpscheck').disabled = false;
   $('download').disabled = $('share').disabled = rows.length === 0;
   log(`Stopped with ${rows.length} samples${gaps ? `, ${gaps} gap(s)` : ''}. Tap Download CSV.`);
 };
